@@ -6,6 +6,7 @@ import torch
 from loguru import logger
 from rapid_table import RapidTable, RapidTableInput
 from rapid_table.main import ModelType
+from PIL import Image
 
 from magic_pdf.libs.config_reader import get_device
 
@@ -39,7 +40,7 @@ class RapidTableModel(object):
         self.ocr_engine = ocr_engine
 
 
-    def predict(self, image):
+    def predict(self, image, table_text_mappings=None):
         bgr_image = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
         # First check the overall image aspect ratio (height/width)
@@ -84,7 +85,9 @@ class RapidTableModel(object):
                 bgr_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
         # Continue with OCR on potentially rotated image
-        ocr_result = self.ocr_engine.ocr(bgr_image)[0]
+        if table_text_mappings:
+            ocr_result = table_text_mappings
+        
         if ocr_result:
             ocr_result = [[item[0], item[1][0], item[1][1]] for item in ocr_result if
                       len(item) == 2 and isinstance(item[1], tuple)]

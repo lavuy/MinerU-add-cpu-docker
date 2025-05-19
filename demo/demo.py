@@ -1,4 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import sys
+sys.path = ["/home/yuvalp/projects/MinerU"] + sys.path
 import os
 
 from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
@@ -9,8 +11,10 @@ from magic_pdf.config.enums import SupportedPdfParseMethod
 # args
 __dir__ = os.path.dirname(os.path.abspath(__file__))
 pdf_file_name = os.path.join(__dir__, "pdfs", "demo1.pdf")  # replace with the real pdf path
+pdf_file_name = "/home/yuvalp/projects/MinerU/demo/pdfs/סדר יום ועדת משנה לתכנון ובניה 2-25-0008.pdf"
 name_without_extension = os.path.basename(pdf_file_name).split('.')[0]
-
+print(f"pdf_file_name: {pdf_file_name}")
+print(f"name_without_extension: {name_without_extension}")
 # prepare env
 local_image_dir = os.path.join(__dir__, "output", name_without_extension, "images")
 local_md_dir = os.path.join(__dir__, "output", name_without_extension)

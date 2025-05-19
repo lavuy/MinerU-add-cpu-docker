@@ -9,11 +9,35 @@ from magic_pdf.model.sub_modules.model_utils import (
     clean_vram, crop_img, get_res_list_from_layout_res)
 from magic_pdf.model.sub_modules.ocr.paddleocr2pytorch.ocr_utils import (
     get_adjusted_mfdetrec_res, get_ocr_result_list)
-
+import copy
+from pymupdf import Rect
 YOLO_LAYOUT_BASE_BATCH_SIZE = 1
 MFD_BASE_BATCH_SIZE = 1
 MFR_BASE_BATCH_SIZE = 16
 
+def to_rect(poly, scale):
+    crop_xmin, crop_ymin = int(poly[0]/scale), int(poly[1]/scale)
+    crop_xmax, crop_ymax = int(poly[4]/scale), int(poly[5]/scale)
+    return Rect(x0=crop_xmin, y0=crop_ymin, x1=crop_xmax, y1=crop_ymax)
+
+def to_ocr_record(ocr_row, scale):
+    top_left = [ocr_row[0] * scale, ocr_row[1] * scale]
+    top_right = [ocr_row[2] * scale, ocr_row[1] * scale]
+    bottom_right = [ocr_row[2] * scale, ocr_row[3] * scale]
+    bottom_left = [ocr_row[0] * scale, ocr_row[3] * scale]
+    polygon = [top_left, top_right, bottom_right, bottom_left]
+    ocr_result = [polygon, tuple([ocr_row[4], 1])]
+    return ocr_result
+
+def get_table_metadata_text_mappings(page_data, table_res, original_image):
+    # The image is upscaled, so we need to scale the table_res['poly']
+    scale = original_image.shape[0] / page_data.mediabox.height
+    rect = to_rect(table_res['poly'], scale=scale)
+    page_data.set_cropbox(rect)
+    word_ocr_results = [to_ocr_record(word, scale=scale) for word in page_data.get_textpage().extractWORDS()]
+    # Reset cropbox
+    page_data.set_cropbox(page_data.mediabox)
+    return word_ocr_results
 
 class BatchAnalyze:
     def __init__(self, model_manager, batch_ratio: int, show_log, layout_model, formula_enable, table_enable):
@@ -39,7 +63,7 @@ class BatchAnalyze:
             table_enable = self.table_enable,
         )
 
-        images = [image for image, _, _ in images_with_extra_info]
+        images = [image for image, _, _ , _ in images_with_extra_info]
 
         if self.model.layout_model_name == MODEL_NAME.LAYOUTLMv3:
             # layoutlmv3
@@ -93,7 +117,7 @@ class BatchAnalyze:
         ocr_res_list_all_page = []
         table_res_list_all_page = []
         for index in range(len(images)):
-            _, ocr_enable, _lang = images_with_extra_info[index]
+            _, ocr_enable, _lang, page_data = images_with_extra_info[index]
             layout_res = images_layout_res[index]
             np_array_img = images[index]
 
@@ -111,9 +135,11 @@ class BatchAnalyze:
 
             for table_res in table_res_list:
                 table_img, _ = crop_img(table_res, np_array_img)
+                table_text_mappings = get_table_metadata_text_mappings(page_data, table_res, np_array_img)
                 table_res_list_all_page.append({'table_res':table_res,
                                                 'lang':_lang,
                                                 'table_img':table_img,
+                                                'table_text_mappings':table_text_mappings,
                                               })
 
         # 文本框检测
@@ -170,7 +196,7 @@ class BatchAnalyze:
                     lang=_lang,
                     table_sub_model_name='slanet_plus'
                 )
-                html_code, table_cell_bboxes, logic_points, elapse = table_model.predict(table_res_dict['table_img'])
+                html_code, table_cell_bboxes, logic_points, elapse = table_model.predict(table_res_dict['table_img'], table_res_dict['table_text_mappings'])
                 # 判断是否返回正常
                 if html_code:
                     expected_ending = html_code.strip().endswith(

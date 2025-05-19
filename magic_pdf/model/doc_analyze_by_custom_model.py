@@ -140,14 +140,16 @@ def doc_analyze(
     MIN_BATCH_INFERENCE_SIZE = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 200))
     images = []
     page_wh_list = []
+    pages = []
     for index in range(len(dataset)):
         if start_page_id <= index <= end_page_id:
             page_data = dataset.get_page(index)
             img_dict = page_data.get_image()
             images.append(img_dict['img'])
             page_wh_list.append((img_dict['width'], img_dict['height']))
-
-    images_with_extra_info = [(images[index], ocr, dataset._lang) for index in range(len(images))]
+            pages.append(page_data.get_doc())
+            
+    images_with_extra_info = [(images[index], ocr, dataset._lang, pages[index]) for index in range(len(images))]
 
     if len(images) >= MIN_BATCH_INFERENCE_SIZE:
         batch_size = MIN_BATCH_INFERENCE_SIZE
