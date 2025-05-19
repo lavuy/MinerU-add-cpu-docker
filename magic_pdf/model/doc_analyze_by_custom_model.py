@@ -1,22 +1,19 @@
 import os
 import time
 
-# 关闭paddle的信号处理
-import paddle
-from loguru import logger
+import numpy as np
+import torch
 
-paddle.disable_signal_handler()
-
+os.environ['FLAGS_npu_jit_compile'] = '0'  # 关闭paddle的jit编译
+os.environ['FLAGS_use_stride_kernel'] = '0'
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 
-try:
-    import torchtext
 
-    if torchtext.__version__ >= '0.18.0':
-        torchtext.disable_torchtext_deprecation_warning()
-except ImportError:
-    pass
+from loguru import logger
 
+from magic_pdf.model.sub_modules.model_utils import get_vram
+from magic_pdf.config.enums import SupportedPdfParseMethod
 import magic_pdf.model as model_config
 from magic_pdf.data.dataset import Dataset
 from magic_pdf.libs.clean_memory import clean_memory
@@ -25,22 +22,6 @@ from magic_pdf.libs.config_reader import (get_device, get_formula_config,
                                           get_local_models_dir,
                                           get_table_recog_config)
 from magic_pdf.model.model_list import MODEL
-from magic_pdf.operators.models import InferenceResult
-
-
-def dict_compare(d1, d2):
-    return d1.items() == d2.items()
-
-
-def remove_duplicates_dicts(lst):
-    unique_dicts = []
-    for dict_item in lst:
-        if not any(
-            dict_compare(dict_item, existing_dict) for existing_dict in unique_dicts
-        ):
-            unique_dicts.append(dict_item)
-    return unique_dicts
-
 
 class ModelSingleton:
     _instance = None
@@ -81,9 +62,7 @@ def custom_model_init(
     formula_enable=None,
     table_enable=None,
 ):
-
     model = None
-
     if model_config.__model_mode__ == 'lite':
         logger.warning(
             'The Lite mode is provided for developers to conduct testing only, and the output quality is '
@@ -141,7 +120,6 @@ def custom_model_init(
 
     return custom_model
 
-
 def doc_analyze(
     dataset: Dataset,
     ocr: bool = False,
@@ -152,46 +130,174 @@ def doc_analyze(
     layout_model=None,
     formula_enable=None,
     table_enable=None,
-) -> InferenceResult:
-
-    model_manager = ModelSingleton()
-    custom_model = model_manager.get_model(
-        ocr, show_log, lang, layout_model, formula_enable, table_enable
+):
+    end_page_id = (
+        end_page_id
+        if end_page_id is not None and end_page_id >= 0
+        else len(dataset) - 1
     )
 
-    model_json = []
-    doc_analyze_start = time.time()
-
-    if end_page_id is None:
-        end_page_id = len(dataset)
-
+    MIN_BATCH_INFERENCE_SIZE = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 200))
+    images = []
+    page_wh_list = []
+    pages = []
     for index in range(len(dataset)):
-        page_data = dataset.get_page(index)
-        img_dict = page_data.get_image()
-        img = img_dict['img']
-        page_width = img_dict['width']
-        page_height = img_dict['height']
         if start_page_id <= index <= end_page_id:
-            page_start = time.time()
-            result = custom_model(img)
-            logger.info(f'-----page_id : {index}, page total time: {round(time.time() - page_start, 2)}-----')
+            page_data = dataset.get_page(index)
+            img_dict = page_data.get_image()
+            images.append(img_dict['img'])
+            page_wh_list.append((img_dict['width'], img_dict['height']))
+            pages.append(page_data.get_doc())
+            
+    images_with_extra_info = [(images[index], ocr, dataset._lang, pages[index]) for index in range(len(images))]
+
+    if len(images) >= MIN_BATCH_INFERENCE_SIZE:
+        batch_size = MIN_BATCH_INFERENCE_SIZE
+        batch_images = [images_with_extra_info[i:i+batch_size] for i in range(0, len(images_with_extra_info), batch_size)]
+    else:
+        batch_images = [images_with_extra_info]
+
+    results = []
+    processed_images_count = 0
+    for index, batch_image in enumerate(batch_images):
+        processed_images_count += len(batch_image)
+        logger.info(f'Batch {index + 1}/{len(batch_images)}: {processed_images_count} pages/{len(images_with_extra_info)} pages')
+        result = may_batch_image_analyze(batch_image, ocr, show_log,layout_model, formula_enable, table_enable)
+        results.extend(result)
+
+    model_json = []
+    for index in range(len(dataset)):
+        if start_page_id <= index <= end_page_id:
+            result = results.pop(0)
+            page_width, page_height = page_wh_list.pop(0)
         else:
             result = []
+            page_height = 0
+            page_width = 0
 
-        page_info = {'page_no': index, 'height': page_height, 'width': page_width}
+        page_info = {'page_no': index, 'width': page_width, 'height': page_height}
         page_dict = {'layout_dets': result, 'page_info': page_info}
         model_json.append(page_dict)
 
-    gc_start = time.time()
-    clean_memory(get_device())
-    gc_time = round(time.time() - gc_start, 2)
-    logger.info(f'gc time: {gc_time}')
-
-    doc_analyze_time = round(time.time() - doc_analyze_start, 2)
-    doc_analyze_speed = round((end_page_id + 1 - start_page_id) / doc_analyze_time, 2)
-    logger.info(
-        f'doc analyze time: {round(time.time() - doc_analyze_start, 2)},'
-        f' speed: {doc_analyze_speed} pages/second'
-    )
-
+    from magic_pdf.operators.models import InferenceResult
     return InferenceResult(model_json, dataset)
+
+def batch_doc_analyze(
+    datasets: list[Dataset],
+    parse_method: str = 'auto',
+    show_log: bool = False,
+    lang=None,
+    layout_model=None,
+    formula_enable=None,
+    table_enable=None,
+):
+    MIN_BATCH_INFERENCE_SIZE = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 200))
+    batch_size = MIN_BATCH_INFERENCE_SIZE
+    page_wh_list = []
+
+    images_with_extra_info = []
+    for dataset in datasets:
+
+        ocr = False
+        if parse_method == 'auto':
+            if dataset.classify() == SupportedPdfParseMethod.TXT:
+                ocr = False
+            elif dataset.classify() == SupportedPdfParseMethod.OCR:
+                ocr = True
+        elif parse_method == 'ocr':
+            ocr = True
+        elif parse_method == 'txt':
+            ocr = False
+
+        _lang = dataset._lang
+
+        for index in range(len(dataset)):
+            page_data = dataset.get_page(index)
+            img_dict = page_data.get_image()
+            page_wh_list.append((img_dict['width'], img_dict['height']))
+            images_with_extra_info.append((img_dict['img'], ocr, _lang))
+
+    batch_images = [images_with_extra_info[i:i+batch_size] for i in range(0, len(images_with_extra_info), batch_size)]
+    results = []
+    processed_images_count = 0
+    for index, batch_image in enumerate(batch_images):
+        processed_images_count += len(batch_image)
+        logger.info(f'Batch {index + 1}/{len(batch_images)}: {processed_images_count} pages/{len(images_with_extra_info)} pages')
+        result = may_batch_image_analyze(batch_image, True, show_log, layout_model, formula_enable, table_enable)
+        results.extend(result)
+
+    infer_results = []
+    from magic_pdf.operators.models import InferenceResult
+    for index in range(len(datasets)):
+        dataset = datasets[index]
+        model_json = []
+        for i in range(len(dataset)):
+            result = results.pop(0)
+            page_width, page_height = page_wh_list.pop(0)
+            page_info = {'page_no': i, 'width': page_width, 'height': page_height}
+            page_dict = {'layout_dets': result, 'page_info': page_info}
+            model_json.append(page_dict)
+        infer_results.append(InferenceResult(model_json, dataset))
+    return infer_results
+
+
+def may_batch_image_analyze(
+        images_with_extra_info: list[(np.ndarray, bool, str)],
+        ocr: bool,
+        show_log: bool = False,
+        layout_model=None,
+        formula_enable=None,
+        table_enable=None):
+    # os.environ['CUDA_VISIBLE_DEVICES'] = str(idx)
+
+    from magic_pdf.model.batch_analyze import BatchAnalyze
+
+    model_manager = ModelSingleton()
+
+    # images = [image for image, _, _ in images_with_extra_info]
+    batch_ratio = 1
+    device = get_device()
+
+    if str(device).startswith('npu'):
+        import torch_npu
+        if torch_npu.npu.is_available():
+            torch.npu.set_compile_mode(jit_compile=False)
+
+    if str(device).startswith('npu') or str(device).startswith('cuda'):
+        vram = get_vram(device)
+        if vram is not None:
+            gpu_memory = int(os.getenv('VIRTUAL_VRAM_SIZE', round(vram)))
+            if gpu_memory >= 16:
+                batch_ratio = 16
+            elif gpu_memory >= 12:
+                batch_ratio = 8
+            elif gpu_memory >= 8:
+                batch_ratio = 4
+            elif gpu_memory >= 6:
+                batch_ratio = 2
+            else:
+                batch_ratio = 1
+            logger.info(f'gpu_memory: {gpu_memory} GB, batch_ratio: {batch_ratio}')
+        else:
+            # Default batch_ratio when VRAM can't be determined
+            batch_ratio = 1
+            logger.info(f'Could not determine GPU memory, using default batch_ratio: {batch_ratio}')
+
+
+    # doc_analyze_start = time.time()
+
+    batch_model = BatchAnalyze(model_manager, batch_ratio, show_log, layout_model, formula_enable, table_enable)
+    results = batch_model(images_with_extra_info)
+
+    # gc_start = time.time()
+    clean_memory(get_device())
+    # gc_time = round(time.time() - gc_start, 2)
+    # logger.debug(f'gc time: {gc_time}')
+
+    # doc_analyze_time = round(time.time() - doc_analyze_start, 2)
+    # doc_analyze_speed = round(len(images) / doc_analyze_time, 2)
+    # logger.debug(
+    #     f'doc analyze time: {round(time.time() - doc_analyze_start, 2)},'
+    #     f' speed: {doc_analyze_speed} pages/second'
+    # )
+    return results

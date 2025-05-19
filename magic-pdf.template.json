@@ -16,8 +16,19 @@
     },
     "table-config": {
         "model": "rapid_table",
+        "sub_model": "slanet_plus",
         "enable": true,
         "max_time": 400
+    },
+    "latex-delimiter-config": {
+        "display": {
+            "left": "$$",
+            "right": "$$"
+        },
+        "inline": {
+            "left": "$",
+            "right": "$"
+        }
     },
     "llm-aided-config": {
         "formula_aided": {
@@ -39,5 +50,5 @@
             "enable": false
         }
     },
-    "config_version": "1.1.0"
+    "config_version": "1.2.1"
 }

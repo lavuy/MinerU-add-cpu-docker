@@ -5,6 +5,7 @@ from loguru import logger
 from magic_pdf.config.make_content_config import DropMode, MakeMode
 from magic_pdf.config.ocr_content_type import BlockType, ContentType
 from magic_pdf.libs.commons import join_path
+from magic_pdf.libs.config_reader import get_latex_delimiter_config
 from magic_pdf.libs.language import detect_lang
 from magic_pdf.libs.markdown_utils import ocr_escape_special_markdown_char
 from magic_pdf.post_proc.para_split_v3 import ListLineTag
@@ -126,11 +127,45 @@ def detect_language(text):
         return 'empty'
 
 
+def full_to_half(text: str) -> str:
+    """Convert full-width characters to half-width characters using code point manipulation.
+
+    Args:
+        text: String containing full-width characters
+
+    Returns:
+        String with full-width characters converted to half-width
+    """
+    result = []
+    for char in text:
+        code = ord(char)
+        # Full-width letters and numbers (FF21-FF3A for A-Z, FF41-FF5A for a-z, FF10-FF19 for 0-9)
+        if (0xFF21 <= code <= 0xFF3A) or (0xFF41 <= code <= 0xFF5A) or (0xFF10 <= code <= 0xFF19):
+            result.append(chr(code - 0xFEE0))  # Shift to ASCII range
+        else:
+            result.append(char)
+    return ''.join(result)
+
+latex_delimiters_config = get_latex_delimiter_config()
+
+default_delimiters = {
+    'display': {'left': '$$', 'right': '$$'},
+    'inline': {'left': '$', 'right': '$'}
+}
+
+delimiters = latex_delimiters_config if latex_delimiters_config else default_delimiters
+
+display_left_delimiter = delimiters['display']['left']
+display_right_delimiter = delimiters['display']['right']
+inline_left_delimiter = delimiters['inline']['left']
+inline_right_delimiter = delimiters['inline']['right']
+
 def merge_para_with_text(para_block):
     block_text = ''
     for line in para_block['lines']:
         for span in line['spans']:
             if span['type'] in [ContentType.Text]:
+                span['content'] = full_to_half(span['content'])
                 block_text += span['content']
     block_lang = detect_lang(block_text)
 
@@ -147,9 +182,9 @@ def merge_para_with_text(para_block):
             if span_type == ContentType.Text:
                 content = ocr_escape_special_markdown_char(span['content'])
             elif span_type == ContentType.InlineEquation:
-                content = f"${span['content']}$"
+                content = f"{inline_left_delimiter}{span['content']}{inline_right_delimiter}"
             elif span_type == ContentType.InterlineEquation:
-                content = f"\n$$\n{span['content']}\n$$\n"
+                content = f"\n{display_left_delimiter}\n{span['content']}\n{display_right_delimiter}\n"
 
             content = content.strip()
 
@@ -187,12 +222,13 @@ def para_to_standard_format_v2(para_block, img_buket_path, page_idx, drop_reason
             'text': merge_para_with_text(para_block),
         }
     elif para_type == BlockType.Title:
-        title_level = get_title_level(para_block)
         para_content = {
             'type': 'text',
             'text': merge_para_with_text(para_block),
-            'text_level': title_level,
         }
+        title_level = get_title_level(para_block)
+        if title_level != 0:
+            para_content['text_level'] = title_level
     elif para_type == BlockType.InterlineEquation:
         para_content = {
             'type': 'equation',
@@ -298,5 +334,5 @@ def get_title_level(block):
     if title_level > 4:
         title_level = 4
     elif title_level < 1:
-        title_level = 1
+        title_level = 0
     return title_level

@@ -1,18 +1,23 @@
 import copy
+import math
 import os
 import re
 import statistics
 import time
+import warnings
 from typing import List
 
+import cv2
 import fitz
 import torch
+import numpy as np
 from loguru import logger
+from tqdm import tqdm
 
 from magic_pdf.config.enums import SupportedPdfParseMethod
 from magic_pdf.config.ocr_content_type import BlockType, ContentType
 from magic_pdf.data.dataset import Dataset, PageableData
-from magic_pdf.libs.boxbase import calculate_overlap_area_in_bbox1_area_ratio
+from magic_pdf.libs.boxbase import calculate_overlap_area_in_bbox1_area_ratio, __is_overlaps_y_exceeds_threshold
 from magic_pdf.libs.clean_memory import clean_memory
 from magic_pdf.libs.config_reader import get_local_layoutreader_model_dir, get_llm_aided_config, get_device
 from magic_pdf.libs.convert_utils import dict_to_list
@@ -21,14 +26,6 @@ from magic_pdf.libs.pdf_image_tools import cut_image_to_pil_image
 from magic_pdf.model.magic_model import MagicModel
 from magic_pdf.post_proc.llm_aided import llm_aided_formula, llm_aided_text, llm_aided_title
 
-try:
-    import torchtext
-
-    if torchtext.__version__ >= '0.18.0':
-        torchtext.disable_torchtext_deprecation_warning()
-except ImportError:
-    pass
-
 from magic_pdf.model.sub_modules.model_init import AtomModelSingleton
 from magic_pdf.post_proc.para_split_v3 import para_split
 from magic_pdf.pre_proc.construct_page_dict import ocr_construct_page_component_v2
@@ -36,7 +33,7 @@ from magic_pdf.pre_proc.cut_image import ocr_cut_image_and_table
 from magic_pdf.pre_proc.ocr_detect_all_bboxes import ocr_prepare_bboxes_for_layout_split_v2
 from magic_pdf.pre_proc.ocr_dict_merge import fill_spans_in_blocks, fix_block_spans_v2, fix_discarded_block
 from magic_pdf.pre_proc.ocr_span_list_modify import get_qa_need_list_v2, remove_overlaps_low_confidence_spans, \
-    remove_overlaps_min_spans, check_chars_is_overlap_in_span
+    remove_overlaps_min_spans, remove_x_overlapping_chars
 
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 
@@ -58,14 +55,6 @@ def __replace_STX_ETX(text_str: str):
     return text_str
 
 
-def __replace_0xfffd(text_str: str):
-    """Replace \ufffd, as these characters become garbled when extracted using pymupdf."""
-    if text_str:
-        s = text_str.replace('\ufffd', " ")
-        return s
-    return text_str
-
-
 # 连写字符拆分
 def __replace_ligatures(text: str):
     ligatures = {
@@ -78,16 +67,17 @@ def chars_to_content(span):
     # 检查span中的char是否为空
     if len(span['chars']) == 0:
         pass
-        # span['content'] = ''
-    elif check_chars_is_overlap_in_span(span['chars']):
-        pass
     else:
         # 先给chars按char['bbox']的中心点的x坐标排序
         span['chars'] = sorted(span['chars'], key=lambda x: (x['bbox'][0] + x['bbox'][2]) / 2)
 
-        # 求char的平均宽度
-        char_width_sum = sum([char['bbox'][2] - char['bbox'][0] for char in span['chars']])
-        char_avg_width = char_width_sum / len(span['chars'])
+        # Calculate the width of each character
+        char_widths = [char['bbox'][2] - char['bbox'][0] for char in span['chars']]
+        # Calculate the median width
+        median_width = statistics.median(char_widths)
+
+        # 通过x轴重叠比率移除一部分char
+        span = remove_x_overlapping_chars(span, median_width)
 
         content = ''
         for char in span['chars']:
@@ -95,13 +85,12 @@ def chars_to_content(span):
             # 如果下一个char的x0和上一个char的x1距离超过0.25个字符宽度，则需要在中间插入一个空格
             char1 = char
             char2 = span['chars'][span['chars'].index(char) + 1] if span['chars'].index(char) + 1 < len(span['chars']) else None
-            if char2 and char2['bbox'][0] - char1['bbox'][2] > char_avg_width * 0.25 and char['c'] != ' ' and char2['c'] != ' ':
+            if char2 and char2['bbox'][0] - char1['bbox'][2] > median_width * 0.25 and char['c'] != ' ' and char2['c'] != ' ':
                 content += f"{char['c']} "
             else:
                 content += char['c']
 
-        content = __replace_ligatures(content)
-        span['content'] = __replace_0xfffd(content)
+        span['content'] = __replace_ligatures(content)
 
     del span['chars']
 
@@ -116,25 +105,21 @@ def fill_char_in_spans(spans, all_chars):
     spans = sorted(spans, key=lambda x: x['bbox'][1])
 
     for char in all_chars:
-        # 跳过非法bbox的char
-        x1, y1, x2, y2 = char['bbox']
-        if abs(x1 - x2) <= 0.01 or abs(y1 - y2) <= 0.01:
-            continue
+
         for span in spans:
             if calculate_char_in_span(char['bbox'], span['bbox'], char['c']):
                 span['chars'].append(char)
                 break
 
-    empty_spans = []
-
+    need_ocr_spans = []
     for span in spans:
         chars_to_content(span)
         # 有的span中虽然没有字但有一两个空的占位符，用宽高和content长度过滤
         if len(span['content']) * span['height'] < span['width'] * 0.5:
             # logger.info(f"maybe empty span: {len(span['content'])}, {span['height']}, {span['width']}")
-            empty_spans.append(span)
+            need_ocr_spans.append(span)
         del span['height'], span['width']
-    return empty_spans
+    return need_ocr_spans
 
 
 # 使用鲁棒性更强的中心点坐标判断
@@ -173,12 +158,60 @@ def calculate_char_in_span(char_bbox, span_bbox, char, span_height_radio=0.33):
             return False
 
 
+def remove_tilted_line(text_blocks):
+    for block in text_blocks:
+        remove_lines = []
+        for line in block['lines']:
+            cosine, sine = line['dir']
+            # 计算弧度值
+            angle_radians = math.atan2(sine, cosine)
+            # 将弧度值转换为角度值
+            angle_degrees = math.degrees(angle_radians)
+            if 2 < abs(angle_degrees) < 88:
+                remove_lines.append(line)
+        for line in remove_lines:
+            block['lines'].remove(line)
+
+
+def calculate_contrast(img, img_mode) -> float:
+    """
+    计算给定图像的对比度。
+    :param img: 图像，类型为numpy.ndarray
+    :Param img_mode = 图像的色彩通道，'rgb' 或 'bgr'
+    :return: 图像的对比度值
+    """
+    if img_mode == 'rgb':
+        # 将RGB图像转换为灰度图
+        gray_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    elif img_mode == 'bgr':
+        # 将BGR图像转换为灰度图
+        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        raise ValueError("Invalid image mode. Please provide 'rgb' or 'bgr'.")
+
+    # 计算均值和标准差
+    mean_value = np.mean(gray_img)
+    std_dev = np.std(gray_img)
+    # 对比度定义为标准差除以平均值（加上小常数避免除零错误）
+    contrast = std_dev / (mean_value + 1e-6)
+    # logger.debug(f"contrast: {contrast}")
+    return round(contrast, 2)
+
+# @measure_time
 def txt_spans_extract_v2(pdf_page, spans, all_bboxes, all_discarded_blocks, lang):
     # cid用0xfffd表示，连字符拆开
     # text_blocks_raw = pdf_page.get_text('rawdict', flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)['blocks']
 
     # cid用0xfffd表示，连字符不拆开
-    text_blocks_raw = pdf_page.get_text('rawdict', flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)['blocks']
+    #text_blocks_raw = pdf_page.get_text('rawdict', flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP)['blocks']
+
+    # 自定义flags出现较多0xfffd，可能是pymupdf可以自行处理内置字典的pdf，不再使用
+    text_blocks_raw = pdf_page.get_text('rawdict', flags=fitz.TEXTFLAGS_TEXT)['blocks']
+    # text_blocks = pdf_page.get_text('dict', flags=fitz.TEXTFLAGS_TEXT)['blocks']
+
+    # 移除所有角度不为0或90的line
+    remove_tilted_line(text_blocks_raw)
+
     all_pymu_chars = []
     for block in text_blocks_raw:
         for line in block['lines']:
@@ -249,57 +282,58 @@ def txt_spans_extract_v2(pdf_page, spans, all_bboxes, all_discarded_blocks, lang
             span['chars'] = []
             new_spans.append(span)
 
-    empty_spans = fill_char_in_spans(new_spans, all_pymu_chars)
+    need_ocr_spans = fill_char_in_spans(new_spans, all_pymu_chars)
 
-    if len(empty_spans) > 0:
+    if len(need_ocr_spans) > 0:
 
         # 初始化ocr模型
-        atom_model_manager = AtomModelSingleton()
-        ocr_model = atom_model_manager.get_atom_model(
-            atom_model_name='ocr',
-            ocr_show_log=False,
-            det_db_box_thresh=0.3,
-            lang=lang
-        )
+        # atom_model_manager = AtomModelSingleton()
+        # ocr_model = atom_model_manager.get_atom_model(
+        #     atom_model_name='ocr',
+        #     ocr_show_log=False,
+        #     det_db_box_thresh=0.3,
+        #     lang=lang
+        # )
 
-        for span in empty_spans:
+        for span in need_ocr_spans:
             # 对span的bbox截图再ocr
             span_img = cut_image_to_pil_image(span['bbox'], pdf_page, mode='cv2')
-            ocr_res = ocr_model.ocr(span_img, det=False)
-            if ocr_res and len(ocr_res) > 0:
-                if len(ocr_res[0]) > 0:
-                    ocr_text, ocr_score = ocr_res[0][0]
-                    # logger.info(f"ocr_text: {ocr_text}, ocr_score: {ocr_score}")
-                    if ocr_score > 0.5 and len(ocr_text) > 0:
-                        span['content'] = ocr_text
-                        span['score'] = ocr_score
-                    else:
-                        spans.remove(span)
+
+            # 计算span的对比度，低于0.20的span不进行ocr
+            if calculate_contrast(span_img, img_mode='bgr') <= 0.17:
+                spans.remove(span)
+                continue
+                # pass
+
+            span['content'] = ''
+            span['score'] = 1
+            span['np_img'] = span_img
+
+
+            # ocr_res = ocr_model.ocr(span_img, det=False)
+            # if ocr_res and len(ocr_res) > 0:
+            #     if len(ocr_res[0]) > 0:
+            #         ocr_text, ocr_score = ocr_res[0][0]
+            #         # logger.info(f"ocr_text: {ocr_text}, ocr_score: {ocr_score}")
+            #         if ocr_score > 0.5 and len(ocr_text) > 0:
+            #             span['content'] = ocr_text
+            #             span['score'] = float(round(ocr_score, 2))
+            #         else:
+            #             spans.remove(span)
 
     return spans
 
 
 def model_init(model_name: str):
     from transformers import LayoutLMv3ForTokenClassification
-    device = get_device()
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        if torch.cuda.is_bf16_supported():
-            supports_bfloat16 = True
-        else:
-            supports_bfloat16 = False
-    elif str(device).startswith("npu"):
-        import torch_npu
-        if torch_npu.npu.is_available():
-            device = torch.device('npu')
-            supports_bfloat16 = False
-        else:
-            device = torch.device('cpu')
-            supports_bfloat16 = False
-    else:
-        device = torch.device('cpu')
-        supports_bfloat16 = False
+    device_name = get_device()
+    bf_16_support = False
+    if device_name.startswith("cuda"):
+        bf_16_support = torch.cuda.is_bf16_supported()
+    elif device_name.startswith("mps"):
+        bf_16_support = True
 
+    device = torch.device(device_name)
     if model_name == 'layoutreader':
         # 检测modelscope的缓存目录是否存在
         layoutreader_model_dir = get_local_layoutreader_model_dir()
@@ -314,10 +348,10 @@ def model_init(model_name: str):
             model = LayoutLMv3ForTokenClassification.from_pretrained(
                 'hantian/layoutreader'
             )
-        # 检查设备是否支持 bfloat16
-        if supports_bfloat16:
-            model.bfloat16()
-        model.to(device).eval()
+        if bf_16_support:
+            model.to(device).eval().bfloat16()
+        else:
+            model.to(device).eval()
     else:
         logger.error('model name not allow')
         exit(1)
@@ -343,9 +377,12 @@ def do_predict(boxes: List[List[int]], model) -> List[int]:
     from magic_pdf.model.sub_modules.reading_oreder.layoutreader.helpers import (
         boxes2inputs, parse_logits, prepare_inputs)
 
-    inputs = boxes2inputs(boxes)
-    inputs = prepare_inputs(inputs, model)
-    logits = model(**inputs).logits.cpu().squeeze(0)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+
+        inputs = boxes2inputs(boxes)
+        inputs = prepare_inputs(inputs, model)
+        logits = model(**inputs).logits.cpu().squeeze(0)
     return parse_logits(logits, len(boxes))
 
 
@@ -365,10 +402,11 @@ def cal_block_index(fix_blocks, sorted_bboxes):
                 block['index'] = median_value
 
             # 删除图表body block中的虚拟line信息, 并用real_lines信息回填
-            if block['type'] in [BlockType.ImageBody, BlockType.TableBody]:
-                block['virtual_lines'] = copy.deepcopy(block['lines'])
-                block['lines'] = copy.deepcopy(block['real_lines'])
-                del block['real_lines']
+            if block['type'] in [BlockType.ImageBody, BlockType.TableBody, BlockType.Title, BlockType.InterlineEquation]:
+                if 'real_lines' in block:
+                    block['virtual_lines'] = copy.deepcopy(block['lines'])
+                    block['lines'] = copy.deepcopy(block['real_lines'])
+                    del block['real_lines']
     else:
         # 使用xycut排序
         block_bboxes = []
@@ -378,10 +416,11 @@ def cal_block_index(fix_blocks, sorted_bboxes):
             block_bboxes.append(block['bbox'])
 
             # 删除图表body block中的虚拟line信息, 并用real_lines信息回填
-            if block['type'] in [BlockType.ImageBody, BlockType.TableBody]:
-                block['virtual_lines'] = copy.deepcopy(block['lines'])
-                block['lines'] = copy.deepcopy(block['real_lines'])
-                del block['real_lines']
+            if block['type'] in [BlockType.ImageBody, BlockType.TableBody, BlockType.Title, BlockType.InterlineEquation]:
+                if 'real_lines' in block:
+                    block['virtual_lines'] = copy.deepcopy(block['lines'])
+                    block['lines'] = copy.deepcopy(block['real_lines'])
+                    del block['real_lines']
 
         import numpy as np
 
@@ -417,24 +456,24 @@ def insert_lines_into_block(block_bbox, line_height, page_w, page_h):
     block_weight = x1 - x0
 
     # 如果block高度小于n行正文，则直接返回block的bbox
-    if line_height * 3 < block_height:
+    if line_height * 2 < block_height:
         if (
             block_height > page_h * 0.25 and page_w * 0.5 > block_weight > page_w * 0.25
         ):  # 可能是双列结构，可以切细点
-            lines = int(block_height / line_height) + 1
+            lines = int(block_height / line_height)
         else:
             # 如果block的宽度超过0.4页面宽度，则将block分成3行(是一种复杂布局，图不能切的太细)
             if block_weight > page_w * 0.4:
-                line_height = (y1 - y0) / 3
                 lines = 3
             elif block_weight > page_w * 0.25:  # （可能是三列结构，也切细点）
-                lines = int(block_height / line_height) + 1
+                lines = int(block_height / line_height)
             else:  # 判断长宽比
                 if block_height / block_weight > 1.2:  # 细长的不分
                     return [[x0, y0, x1, y1]]
                 else:  # 不细长的还是分成两行
-                    line_height = (y1 - y0) / 2
                     lines = 2
+
+        line_height = (y1 - y0) / lines
 
         # 确定从哪个y位置开始绘制线条
         current_y = y0
@@ -451,32 +490,38 @@ def insert_lines_into_block(block_bbox, line_height, page_w, page_h):
         return [[x0, y0, x1, y1]]
 
 
-def sort_lines_by_model(fix_blocks, page_w, page_h, line_height):
+def sort_lines_by_model(fix_blocks, page_w, page_h, line_height, footnote_blocks):
     page_line_list = []
+
+    def add_lines_to_block(b):
+        line_bboxes = insert_lines_into_block(b['bbox'], line_height, page_w, page_h)
+        b['lines'] = []
+        for line_bbox in line_bboxes:
+            b['lines'].append({'bbox': line_bbox, 'spans': []})
+        page_line_list.extend(line_bboxes)
+
     for block in fix_blocks:
         if block['type'] in [
-            BlockType.Text, BlockType.Title, BlockType.InterlineEquation,
+            BlockType.Text, BlockType.Title,
             BlockType.ImageCaption, BlockType.ImageFootnote,
             BlockType.TableCaption, BlockType.TableFootnote
         ]:
             if len(block['lines']) == 0:
-                bbox = block['bbox']
-                lines = insert_lines_into_block(bbox, line_height, page_w, page_h)
-                for line in lines:
-                    block['lines'].append({'bbox': line, 'spans': []})
-                page_line_list.extend(lines)
+                add_lines_to_block(block)
+            elif block['type'] in [BlockType.Title] and len(block['lines']) == 1 and (block['bbox'][3] - block['bbox'][1]) > line_height * 2:
+                block['real_lines'] = copy.deepcopy(block['lines'])
+                add_lines_to_block(block)
             else:
                 for line in block['lines']:
                     bbox = line['bbox']
                     page_line_list.append(bbox)
-        elif block['type'] in [BlockType.ImageBody, BlockType.TableBody]:
-            bbox = block['bbox']
+        elif block['type'] in [BlockType.ImageBody, BlockType.TableBody, BlockType.InterlineEquation]:
             block['real_lines'] = copy.deepcopy(block['lines'])
-            lines = insert_lines_into_block(bbox, line_height, page_w, page_h)
-            block['lines'] = []
-            for line in lines:
-                block['lines'].append({'bbox': line, 'spans': []})
-            page_line_list.extend(lines)
+            add_lines_to_block(block)
+
+    for block in footnote_blocks:
+        footnote_block = {'bbox': block[:4]}
+        add_lines_to_block(footnote_block)
 
     if len(page_line_list) > 200:  # layoutreader最高支持512line
         return None
@@ -663,17 +708,82 @@ def parse_page_core(
     discarded_blocks = magic_model.get_discarded(page_id)
     text_blocks = magic_model.get_text_blocks(page_id)
     title_blocks = magic_model.get_title_blocks(page_id)
-    inline_equations, interline_equations, interline_equation_blocks = (
-        magic_model.get_equations(page_id)
-    )
-
+    inline_equations, interline_equations, interline_equation_blocks = magic_model.get_equations(page_id)
     page_w, page_h = magic_model.get_page_size(page_id)
+
+    def merge_title_blocks(blocks, x_distance_threshold=0.1*page_w):
+        def merge_two_bbox(b1, b2):
+            x_min = min(b1['bbox'][0], b2['bbox'][0])
+            y_min = min(b1['bbox'][1], b2['bbox'][1])
+            x_max = max(b1['bbox'][2], b2['bbox'][2])
+            y_max = max(b1['bbox'][3], b2['bbox'][3])
+            return x_min, y_min, x_max, y_max
+
+        def merge_two_blocks(b1, b2):
+            # 合并两个标题块的边界框
+            b1['bbox'] = merge_two_bbox(b1, b2)
+
+            # 合并两个标题块的文本内容
+            line1 = b1['lines'][0]
+            line2 = b2['lines'][0]
+            line1['bbox'] = merge_two_bbox(line1, line2)
+            line1['spans'].extend(line2['spans'])
+
+            return b1, b2
+
+        # 按 y 轴重叠度聚集标题块
+        y_overlapping_blocks = []
+        title_bs = [b for b in blocks if b['type'] == BlockType.Title]
+        while title_bs:
+            block1 = title_bs.pop(0)
+            current_row = [block1]
+            to_remove = []
+            for block2 in title_bs:
+                if (
+                    __is_overlaps_y_exceeds_threshold(block1['bbox'], block2['bbox'], 0.9)
+                    and len(block1['lines']) == 1
+                    and len(block2['lines']) == 1
+                ):
+                    current_row.append(block2)
+                    to_remove.append(block2)
+            for b in to_remove:
+                title_bs.remove(b)
+            y_overlapping_blocks.append(current_row)
+
+        # 按x轴坐标排序并合并标题块
+        to_remove_blocks = []
+        for row in y_overlapping_blocks:
+            if len(row) == 1:
+                continue
+
+            # 按x轴坐标排序
+            row.sort(key=lambda x: x['bbox'][0])
+
+            merged_block = row[0]
+            for i in range(1, len(row)):
+                left_block = merged_block
+                right_block = row[i]
+
+                left_height = left_block['bbox'][3] - left_block['bbox'][1]
+                right_height = right_block['bbox'][3] - right_block['bbox'][1]
+
+                if (
+                    right_block['bbox'][0] - left_block['bbox'][2] < x_distance_threshold
+                    and left_height * 0.95 < right_height < left_height * 1.05
+                ):
+                    merged_block, to_remove_block = merge_two_blocks(merged_block, right_block)
+                    to_remove_blocks.append(to_remove_block)
+                else:
+                    merged_block = right_block
+
+        for b in to_remove_blocks:
+            blocks.remove(b)
 
     """将所有区块的bbox整理到一起"""
     # interline_equation_blocks参数不够准，后面切换到interline_equations上
     interline_equation_blocks = []
     if len(interline_equation_blocks) > 0:
-        all_bboxes, all_discarded_blocks = ocr_prepare_bboxes_for_layout_split_v2(
+        all_bboxes, all_discarded_blocks, footnote_blocks = ocr_prepare_bboxes_for_layout_split_v2(
             img_body_blocks, img_caption_blocks, img_footnote_blocks,
             table_body_blocks, table_caption_blocks, table_footnote_blocks,
             discarded_blocks,
@@ -684,7 +794,7 @@ def parse_page_core(
             page_h,
         )
     else:
-        all_bboxes, all_discarded_blocks = ocr_prepare_bboxes_for_layout_split_v2(
+        all_bboxes, all_discarded_blocks, footnote_blocks = ocr_prepare_bboxes_for_layout_split_v2(
             img_body_blocks, img_caption_blocks, img_footnote_blocks,
             table_body_blocks, table_caption_blocks, table_footnote_blocks,
             discarded_blocks,
@@ -753,11 +863,14 @@ def parse_page_core(
     """对block进行fix操作"""
     fix_blocks = fix_block_spans_v2(block_with_spans)
 
+    """同一行被断开的titile合并"""
+    merge_title_blocks(fix_blocks)
+
     """获取所有line并计算正文line的高度"""
     line_height = get_line_height(fix_blocks)
 
     """获取所有line并对line排序"""
-    sorted_bboxes = sort_lines_by_model(fix_blocks, page_w, page_h, line_height)
+    sorted_bboxes = sort_lines_by_model(fix_blocks, page_w, page_h, line_height, footnote_blocks)
 
     """根据line的中位数算block的序列关系"""
     fix_blocks = cal_block_index(fix_blocks, sorted_bboxes)
@@ -814,7 +927,6 @@ def pdf_parse_union(
     magic_model = MagicModel(model_list, dataset)
 
     """根据输入的起始范围解析pdf"""
-    # end_page_id = end_page_id if end_page_id else len(pdf_docs) - 1
     end_page_id = (
         end_page_id
         if end_page_id is not None and end_page_id >= 0
@@ -825,17 +937,18 @@ def pdf_parse_union(
         logger.warning('end_page_id is out of range, use pdf_docs length')
         end_page_id = len(dataset) - 1
 
-    """初始化启动时间"""
-    start_time = time.time()
+    # """初始化启动时间"""
+    # start_time = time.time()
 
-    for page_id, page in enumerate(dataset):
-        """debug时输出每页解析的耗时."""
-        if debug_mode:
-            time_now = time.time()
-            logger.info(
-                f'page_id: {page_id}, last_page_cost_time: {round(time.time() - start_time, 2)}'
-            )
-            start_time = time_now
+    # for page_id, page in enumerate(dataset):
+    for page_id, page in tqdm(enumerate(dataset), total=len(dataset), desc="Processing pages"):
+        # """debug时输出每页解析的耗时."""
+        # if debug_mode:
+            # time_now = time.time()
+            # logger.info(
+            #     f'page_id: {page_id}, last_page_cost_time: {round(time.time() - start_time, 2)}'
+            # )
+            # start_time = time_now
 
         """解析pdf中的每一页"""
         if start_page_id <= page_id <= end_page_id:
@@ -851,6 +964,48 @@ def pdf_parse_union(
             )
         pdf_info_dict[f'page_{page_id}'] = page_info
 
+    need_ocr_list = []
+    img_crop_list = []
+    text_block_list = []
+    for pange_id, page_info in pdf_info_dict.items():
+        for block in page_info['preproc_blocks']:
+            if block['type'] in ['table', 'image']:
+                for sub_block in block['blocks']:
+                    if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
+                        text_block_list.append(sub_block)
+            elif block['type'] in ['text', 'title']:
+                text_block_list.append(block)
+        for block in page_info['discarded_blocks']:
+            text_block_list.append(block)
+    for block in text_block_list:
+        for line in block['lines']:
+            for span in line['spans']:
+                if 'np_img' in span:
+                    need_ocr_list.append(span)
+                    img_crop_list.append(span['np_img'])
+                    span.pop('np_img')
+    if len(img_crop_list) > 0:
+        # Get OCR results for this language's images
+        atom_model_manager = AtomModelSingleton()
+        ocr_model = atom_model_manager.get_atom_model(
+            atom_model_name='ocr',
+            ocr_show_log=False,
+            det_db_box_thresh=0.3,
+            lang=lang
+        )
+        # rec_start = time.time()
+        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+        # Verify we have matching counts
+        assert len(ocr_res_list) == len(need_ocr_list), f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
+        # Process OCR results for this language
+        for index, span in enumerate(need_ocr_list):
+            ocr_text, ocr_score = ocr_res_list[index]
+            span['content'] = ocr_text
+            span['score'] = float(f"{ocr_score:.3f}")
+        # rec_time = time.time() - rec_start
+        # logger.info(f'ocr-dynamic-rec time: {round(rec_time, 2)}, total images processed: {len(img_crop_list)}')
+
+
     """分段"""
     para_split(pdf_info_dict)
 
@@ -861,17 +1016,23 @@ def pdf_parse_union(
         formula_aided_config = llm_aided_config.get('formula_aided', None)
         if formula_aided_config is not None:
             if formula_aided_config.get('enable', False):
+                llm_aided_formula_start_time = time.time()
                 llm_aided_formula(pdf_info_dict, formula_aided_config)
+                logger.info(f'llm aided formula time: {round(time.time() - llm_aided_formula_start_time, 2)}')
         """文本优化"""
         text_aided_config = llm_aided_config.get('text_aided', None)
         if text_aided_config is not None:
             if text_aided_config.get('enable', False):
+                llm_aided_text_start_time = time.time()
                 llm_aided_text(pdf_info_dict, text_aided_config)
+                logger.info(f'llm aided text time: {round(time.time() - llm_aided_text_start_time, 2)}')
         """标题优化"""
         title_aided_config = llm_aided_config.get('title_aided', None)
         if title_aided_config is not None:
             if title_aided_config.get('enable', False):
+                llm_aided_title_start_time = time.time()
                 llm_aided_title(pdf_info_dict, title_aided_config)
+                logger.info(f'llm aided title time: {round(time.time() - llm_aided_title_start_time, 2)}')
 
     """dict转list"""
     pdf_info_list = dict_to_list(pdf_info_dict)
